@@ -210,8 +210,17 @@ jobs:
           KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           mapfile -t APKS < <(find src -name '*.apk' 2>/dev/null | grep -i release | grep -vi androidtest)
-          printf 'APK ditemukan:\n%s\n' "${APKS[@]}"
           [ ${#APKS[@]} -gt 0 ] || { echo "::error::Tidak ada APK release"; exit 1; }
+          # Gradle membuat satu APK per ABI. Pilih yang benar-benar berisi mesin Gecko untuk ABI target.
+          echo "Inventaris APK:"
+          SELECTED=""
+          for a in "${APKS[@]}"; do
+            libs=$(unzip -l "$a" | grep -oE 'lib/[a-z0-9_-]+/' | sort -u | tr '\n' ' ')
+            echo " - $a ($(du -h "$a" | cut -f1)) -> $libs"
+            if [ -z "$SELECTED" ] && unzip -l "$a" | grep -qE "lib/${ABI}/lib(xul|mozglue)\.so"; then SELECTED="$a"; fi
+          done
+          [ -n "$SELECTED" ] || { echo "::error::Tidak ada APK yang berisi Gecko (libxul/libmozglue) untuk ${ABI}"; exit 1; }
+          echo "Dipilih: $SELECTED"
           APKSIGNER=$(find ~/.mozbuild /usr/local/lib/android -name apksigner -type f 2>/dev/null | sort -V | tail -1)
           ZIPALIGN=$(find ~/.mozbuild /usr/local/lib/android -name zipalign -type f 2>/dev/null | sort -V | tail -1)
           if [ -n "${KS_B64:-}" ]; then
@@ -223,10 +232,12 @@ jobs:
               -keyalg RSA -keysize 4096 -validity 36500 -dname "CN=Lin Browser"
           fi
           mkdir -p out
-          "$ZIPALIGN" -f -p 4 "${APKS[0]}" out/aligned.apk
+          "$ZIPALIGN" -f -p 4 "$SELECTED" out/aligned.apk
           "$APKSIGNER" sign --ks ks.jks --ks-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS" \
             --out "out/lin-browser-${FF_VERSION}.apk" out/aligned.apk
           "$APKSIGNER" verify "out/lin-browser-${FF_VERSION}.apk"
+          unzip -l "out/lin-browser-${FF_VERSION}.apk" | grep -E "lib/${ABI}/lib(xul|mozglue)\.so" \
+            || { echo "::error::APK akhir tidak berisi Gecko untuk ${ABI}"; exit 1; }
           rm -f out/aligned.apk ks.jks; ls -lh out
 
       - name: Diagnostik jika gagal
