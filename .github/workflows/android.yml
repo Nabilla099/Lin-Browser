@@ -1,0 +1,259 @@
+name: Lin Browser (Android)
+
+# Run workflow -> biarkan stage = build untuk membuat APK.
+#   build     : kompilasi penuh (beberapa jam per ABI), tanda tangan, upload APK  (default)
+#   configure : berhenti setelah ./mach configure (uji cepat ~20 menit)
+#   inspect   : ~3 menit, hanya mencetak struktur source & uji patch
+on:
+  workflow_dispatch:
+    inputs:
+      ff_version:
+        description: "Versi Firefox yang jadi sumber Gecko"
+        default: "143.0"
+      stage:
+        description: "Tahap yang dijalankan"
+        type: choice
+        options: [build, configure, inspect]
+        default: build
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  FF_VERSION: ${{ github.event.inputs.ff_version || '143.0' }}
+  STAGE: ${{ github.event.inputs.stage || 'build' }}
+  RUSTUP_TOOLCHAIN: "1.89.0"
+
+jobs:
+  inspect:
+    if: github.event.inputs.stage == 'inspect'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unduh & verifikasi source
+        run: bash scripts/fetch-source.sh "$FF_VERSION"
+      - name: Inspeksi struktur source Android
+        run: bash scripts/inspect-source.sh src
+      - name: Uji patch (dry-run)
+        run: python3 android/apply_android.py src --dry-run
+
+  build:
+    if: github.event.inputs.stage != 'inspect'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      ABI: armeabi-v7a
+      TARGET: arm-linux-androideabi
+      RUST_TARGET: thumbv7neon-linux-androideabi
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_BASEDIR: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Lapangkan disk runner
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Info runner & tambah swap (cegah kehabisan memori)
+        run: |
+          echo "CPU: $(nproc)"; free -h; df -h / | tail -1
+          # tambahan swap (file terpisah; swap bawaan /swapfile sedang dipakai). Tidak fatal jika gagal.
+          ( sudo fallocate -l 8G /swapfile2 && sudo chmod 600 /swapfile2 \
+            && sudo mkswap /swapfile2 && sudo swapon /swapfile2 ) || echo "swap tambahan dilewati"
+          free -h
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-android-${{ env.ABI }}-${{ env.FF_VERSION }}-${{ github.run_id }}
+          restore-keys: ccache-android-${{ env.ABI }}-${{ env.FF_VERSION }}-
+
+      - name: Unduh & verifikasi source
+        run: bash scripts/fetch-source.sh "$FF_VERSION"
+
+      - name: Terapkan kustomisasi Lin
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-pil
+          python3 android/apply_android.py src
+
+      - name: Pasang toolchain & dependensi
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config m4 unzip zip uuid-dev xz-utils nasm ccache \
+            python3-dev python3-venv python3-pip \
+            clang-18 lld-18 llvm-18-dev libclang-18-dev
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
+          rustup target add ${{ env.RUST_TARGET }}
+          # cbindgen harus versi yang dipakai Firefox 143. Versi terbaru menghasilkan header yang salah
+          # (error: use of undeclared identifier 'COUNT' di webrender_ffi_generated.h).
+          grep -n -i "cbindgen" src/build/moz.configure/rust.configure | head -10 || true
+          CB=$(grep -h -A12 -i "cbindgen" src/build/moz.configure/rust.configure \
+               | grep -oE 'Version\("0\.[0-9]+\.[0-9]+"\)' | head -1 | grep -oE '0\.[0-9]+\.[0-9]+' || true)
+          CB=${CB:-0.29.0}
+          echo "Memasang cbindgen $CB"
+          cargo install cbindgen --version "=$CB" --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc --version; java -version 2>&1 | head -1; node --version
+
+      - name: Pasang Android SDK & NDK (versi sesuai source)
+        working-directory: src
+        run: |
+          cat > /tmp/ensure_android.py <<'PY'
+          import inspect
+          from mozboot import android
+          sig = inspect.signature(android.ensure_android)
+          print("ensure_android", sig)
+          kw = {"no_interactive": True} if "no_interactive" in sig.parameters else {}
+          android.ensure_android("linux", "x86_64", **kw)
+          PY
+          ./mach python /tmp/ensure_android.py \
+            || ./mach --no-interactive bootstrap --application-choice=mobile_android --no-system-changes
+          ls ~/.mozbuild
+
+      - name: Mirror Maven untuk Gradle (hindari HTTP 429)
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cp android/gradle-mirror.init.gradle "$HOME/.gradle/init.d/mirror.gradle"
+
+      - name: Konfigurasi mozconfig
+        run: |
+          # Compiler target = clang milik NDK (clang sistem tidak punya runtime Android: "-lgcc" tidak ketemu)
+          NDK=$(ls -d "$HOME"/.mozbuild/android-ndk-* | sort -V | tail -1)
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$BIN/clang" --version | head -1
+          # libclang untuk bindgen: pakai milik NDK bila ada (versi sama dengan clang NDK), jika tidak libclang sistem
+          LIBDIR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/lib"
+          if ls "$LIBDIR"/libclang.so* >/dev/null 2>&1; then LIBCLANG="$LIBDIR"; else LIBCLANG=/usr/lib/llvm-18/lib; fi
+          echo "libclang: $LIBCLANG"
+          cp mozconfig.android src/mozconfig
+          {
+            echo "ac_add_options --target=${{ env.TARGET }}"
+            echo "ac_add_options --with-libclang-path=$LIBCLANG"
+            echo "export CC=$BIN/clang"
+            echo "export CXX=$BIN/clang++"
+          } >> src/mozconfig
+          cat src/mozconfig
+
+      - name: Configure
+        working-directory: src
+        run: ./mach --no-interactive configure
+
+      - name: Daftar project & task Gradle
+        if: env.STAGE == 'configure'
+        working-directory: src
+        run: |
+          ./mach gradle -q projects 2>&1 | tail -60 || true
+          ./mach gradle -q :fenix:tasks --all 2>&1 | grep -iE "assemble|bundle" | head -60 || true
+        continue-on-error: true
+
+      - name: Build Gecko (maks 5 jam)
+        if: env.STAGE == 'build'
+        working-directory: src
+        run: |
+          # catat pemakaian memori/disk tiap menit agar penyebab kegagalan terlihat di log
+          ( while true; do echo "[mon] $(date +%T) $(free -m | awk 'NR==2{print "mem_used="$3"MB avail="$7"MB"}') $(free -m | awk 'NR==3{print "swap_used="$3"MB"}') $(df -h / | awk 'NR==2{print "disk_avail="$4}')"; sleep 60; done ) &
+          set -o pipefail
+          END=$(( $(date +%s) + 300*60 ))
+          for i in 1 2 3; do
+            LEFT=$(( END - $(date +%s) )); [ "$LEFT" -gt 60 ] || break
+            if timeout "$LEFT" ./mach build 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"; then ok=1; break; fi
+            echo "::warning::mach build gagal (percobaan $i); build bersifat inkremental, mencoba lagi"
+            sleep 90
+          done
+          [ "${ok:-0}" = 1 ]
+
+      - name: Simpan ccache (walau build timeout/gagal)
+        if: always() && env.STAGE == 'build'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-android-${{ env.ABI }}-${{ env.FF_VERSION }}-${{ github.run_id }}
+
+      - name: Rakit APK
+        if: env.STAGE == 'build'
+        working-directory: src
+        run: |
+          set -o pipefail
+          ok=0
+          for round in 1 2 3; do
+            for t in fenix:app:assembleFenixRelease :fenix:app:assembleFenixRelease \
+                     fenix:assembleFenixRelease :app:assembleFenixRelease; do
+              echo "::group::Putaran $round, task $t"
+              if ./mach gradle "$t" 2>&1 | tee -a "$GITHUB_WORKSPACE/assemble.log"; then ok=1; echo "::endgroup::"; echo "Berhasil: $t"; break 2; fi
+              echo "::endgroup::"
+            done
+            sleep 60
+          done
+          [ "$ok" = 1 ] || { echo "::error::Semua kandidat task Gradle gagal"; exit 1; }
+
+      - name: Tanda tangan APK
+        if: env.STAGE == 'build'
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          mapfile -t APKS < <(find src -name '*.apk' 2>/dev/null | grep -i release | grep -vi androidtest)
+          printf 'APK ditemukan:\n%s\n' "${APKS[@]}"
+          [ ${#APKS[@]} -gt 0 ] || { echo "::error::Tidak ada APK release"; exit 1; }
+          APKSIGNER=$(find ~/.mozbuild /usr/local/lib/android -name apksigner -type f 2>/dev/null | sort -V | tail -1)
+          ZIPALIGN=$(find ~/.mozbuild /usr/local/lib/android -name zipalign -type f 2>/dev/null | sort -V | tail -1)
+          if [ -n "${KS_B64:-}" ]; then
+            echo "$KS_B64" | base64 -d > ks.jks
+          else
+            echo "::warning::Keystore tetap belum diisi; memakai kunci sementara (APK tidak bisa jadi update dari rilis sebelumnya)"
+            KS_PASS=linbrowser-ci; KS_ALIAS=lin
+            keytool -genkeypair -keystore ks.jks -storepass "$KS_PASS" -keypass "$KS_PASS" -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 4096 -validity 36500 -dname "CN=Lin Browser"
+          fi
+          mkdir -p out
+          "$ZIPALIGN" -f -p 4 "${APKS[0]}" out/aligned.apk
+          "$APKSIGNER" sign --ks ks.jks --ks-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS" \
+            --out "out/lin-browser-${FF_VERSION}.apk" out/aligned.apk
+          "$APKSIGNER" verify "out/lin-browser-${FF_VERSION}.apk"
+          rm -f out/aligned.apk ks.jks; ls -lh out
+
+      - name: Diagnostik jika gagal
+        if: failure()
+        run: |
+          free -h || true
+          sudo dmesg 2>/dev/null | grep -i -E "out of memory|oom|killed process" | tail -10 || true
+
+      - name: Unggah log jika gagal
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build.log
+            assemble.log
+            src/obj-android/config.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: env.STAGE == 'build'
+        with:
+          name: lin-browser
+          path: out/lin-browser-*.apk
+
+      - name: Release (jika tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/lin-browser-*.apk

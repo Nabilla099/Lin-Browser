@@ -1,0 +1,19 @@
+# Lin Browser - Gecko for Android (target ditambahkan oleh workflow)
+ac_add_options --enable-application=mobile/android
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-android
+
+ac_add_options --enable-release
+ac_add_options --enable-optimize
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --disable-tests
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+
+# Toolchain sistem (tarball rilis tidak bisa memakai toolchain bootstrap Mozilla)
+ac_add_options --disable-bootstrap
+ac_add_options --without-wasm-sandboxed-libraries
+export HOST_CC=clang-18
+export HOST_CXX=clang++-18
+
+ac_add_options --with-ccache

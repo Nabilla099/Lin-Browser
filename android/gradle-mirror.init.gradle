@@ -1,0 +1,23 @@
+// Maven Central membatasi (HTTP 429) IP runner GitHub. Arahkan ke mirror resmi Google.
+def MIRROR = 'https://maven-central.storage-download.googleapis.com/maven2/'
+def HOSTS = ['https://repo.maven.apache.org/maven2', 'https://repo1.maven.org/maven2']
+
+def rewrite = { repos ->
+    repos.all { repo ->
+        try {
+            if (repo instanceof MavenArtifactRepository && HOSTS.any { repo.url.toString().startsWith(it) }) {
+                repo.url = MIRROR
+            }
+        } catch (ignored) { }
+    }
+}
+
+gradle.beforeSettings { s ->
+    rewrite(s.pluginManagement.repositories)
+    rewrite(s.buildscript.repositories)
+    try { rewrite(s.dependencyResolutionManagement.repositories) } catch (ignored) { }
+}
+gradle.allprojects { p ->
+    rewrite(p.buildscript.repositories)
+    rewrite(p.repositories)
+}
